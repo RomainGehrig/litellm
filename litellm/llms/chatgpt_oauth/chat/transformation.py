@@ -3,15 +3,32 @@ ChatGPT OAuth Chat Completion transformation.
 
 This module provides the configuration class for making chat completion requests
 using ChatGPT Plus OAuth credentials.
+
+Supports two modes:
+1. ChatGPT Backend mode: Uses OAuth access token directly with chatgpt.com/backend-api/codex
+2. Standard OpenAI mode: Uses exchanged API key with api.openai.com/v1
+
+Note: The ChatGPT backend typically uses the Responses API (/responses) rather than
+Chat Completions (/chat/completions) for Codex models. This chat config is mainly
+for compatibility with models that still use the chat completions endpoint.
 """
 
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from litellm._logging import verbose_logger
 from litellm.llms.openai.chat.gpt_transformation import OpenAIGPTConfig
 from litellm.types.llms.openai import AllMessageValues
 
-from ..common_utils import get_chatgpt_oauth_credentials, ChatGPTOAuthError
+from ..common_utils import (
+    ChatGPTBackendMode,
+    ChatGPTOAuthError,
+    CHATGPT_BACKEND_BASE_URL,
+    OPENAI_API_BASE_URL,
+    get_chatgpt_oauth_api_base,
+    get_chatgpt_oauth_credentials,
+    get_chatgpt_oauth_headers,
+    get_chatgpt_oauth_mode,
+)
 
 
 class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
@@ -23,6 +40,7 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
     - Reading OAuth tokens from ~/.codex/auth.json or environment variables
     - Automatic token refresh when tokens expire
     - Token exchange to get API keys when needed
+    - Support for both ChatGPT backend and standard OpenAI API modes
 
     The class is designed to be a drop-in replacement for OpenAI chat completions
     but using ChatGPT Plus subscription credentials.
@@ -60,9 +78,9 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
             # Use provided api_base if specified, otherwise use OAuth api_base
             resolved_api_base = api_base or oauth_api_base
 
-            # Always use OAuth token for authentication (ignore api_key parameter)
+            mode = get_chatgpt_oauth_mode()
             verbose_logger.debug(
-                f"ChatGPT OAuth: Using api_base={resolved_api_base}, "
+                f"ChatGPT OAuth Chat: Using mode={mode.value}, api_base={resolved_api_base}, "
                 f"token={'present' if oauth_token else 'missing'}"
             )
 
@@ -85,7 +103,10 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
         """
         Validate and setup environment for ChatGPT OAuth requests.
 
-        This method gets the OAuth token and sets up the Authorization header.
+        This method gets the OAuth credentials and sets up the appropriate headers
+        based on the backend mode:
+        - For ChatGPT backend: Authorization + ChatGPT-Account-ID headers
+        - For OpenAI API: Authorization header only
 
         Args:
             headers: Request headers dict to update
@@ -97,16 +118,11 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
             api_base: Optional API base URL
 
         Returns:
-            Updated headers dict with Authorization header
+            Updated headers dict with Authorization (and optionally ChatGPT-Account-ID) header
         """
         try:
-            _, oauth_token = get_chatgpt_oauth_credentials()
-
-            headers["Authorization"] = f"Bearer {oauth_token}"
-
-            # Ensure Content-Type is set
-            if "content-type" not in headers and "Content-Type" not in headers:
-                headers["Content-Type"] = "application/json"
+            oauth_headers = get_chatgpt_oauth_headers()
+            headers.update(oauth_headers)
 
             return headers
 
@@ -126,6 +142,10 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
         """
         Get the complete URL for the ChatGPT OAuth API call.
 
+        The URL structure differs based on the backend mode:
+        - ChatGPT backend: Not typically used for chat/completions (uses Responses API)
+        - OpenAI API: api.openai.com/v1/chat/completions
+
         Args:
             api_base: API base URL
             api_key: Not used (OAuth handles auth)
@@ -138,19 +158,39 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
             Complete URL for the API call
         """
         if api_base is None:
-            oauth_api_base, _ = get_chatgpt_oauth_credentials()
-            api_base = oauth_api_base
-
-        endpoint = "chat/completions"
+            try:
+                api_base = get_chatgpt_oauth_api_base()
+            except ChatGPTOAuthError:
+                # Fall back to default OpenAI API
+                api_base = OPENAI_API_BASE_URL
 
         # Remove trailing slash from api_base if present
         api_base = api_base.rstrip("/")
 
-        # Check if endpoint is already in the api_base
-        if endpoint in api_base:
-            return api_base
+        # Determine if we're using ChatGPT backend or OpenAI API
+        is_chatgpt_backend = "backend-api" in api_base or api_base == CHATGPT_BACKEND_BASE_URL
 
-        return f"{api_base}/{endpoint}"
+        if is_chatgpt_backend:
+            # ChatGPT backend doesn't typically support /chat/completions
+            # For Codex models, it uses /responses instead
+            # But we still construct the URL in case it's needed
+            verbose_logger.warning(
+                "ChatGPT OAuth Chat: ChatGPT backend typically uses /responses, not /chat/completions"
+            )
+            return f"{api_base}/chat/completions"
+        else:
+            # Standard OpenAI API: api.openai.com/v1/chat/completions
+            endpoint = "chat/completions"
+
+            # Check if endpoint is already in the api_base
+            if endpoint in api_base:
+                return api_base
+
+            # Ensure we have /v1 in the path for OpenAI
+            if "api.openai.com" in api_base and "/v1" not in api_base:
+                api_base = f"{api_base}/v1"
+
+            return f"{api_base}/{endpoint}"
 
     @staticmethod
     def get_api_key(api_key: Optional[str] = None) -> Optional[str]:
@@ -186,7 +226,6 @@ class ChatGPTOAuthChatConfig(OpenAIGPTConfig):
         if api_base:
             return api_base
         try:
-            oauth_api_base, _ = get_chatgpt_oauth_credentials()
-            return oauth_api_base
+            return get_chatgpt_oauth_api_base()
         except ChatGPTOAuthError:
-            return "https://api.openai.com/v1"
+            return OPENAI_API_BASE_URL

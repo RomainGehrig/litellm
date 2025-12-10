@@ -4,12 +4,17 @@ Common utilities for ChatGPT OAuth provider.
 This module handles OAuth token management for ChatGPT Plus authentication,
 including reading tokens from the Codex CLI auth file, refreshing expired tokens,
 and exchanging tokens for OpenAI API keys.
+
+Supports two modes:
+1. ChatGPT Backend mode: Uses OAuth access token directly with chatgpt.com/backend-api/codex
+2. Standard OpenAI mode: Exchanges OAuth token for API key and uses api.openai.com/v1
 """
 
 import json
 import os
 import threading
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -30,10 +35,29 @@ class ChatGPTOAuthError(Exception):
         super().__init__(self.message)
 
 
+class ChatGPTBackendMode(str, Enum):
+    """Backend mode for ChatGPT OAuth provider."""
+
+    # Use ChatGPT backend directly with OAuth access token
+    # URL: chatgpt.com/backend-api/codex
+    CHATGPT_BACKEND = "chatgpt_backend"
+
+    # Use standard OpenAI API with exchanged API key
+    # URL: api.openai.com/v1
+    OPENAI_API = "openai_api"
+
+    # Auto-detect based on available credentials
+    AUTO = "auto"
+
+
 # Default OAuth configuration (matches Codex CLI)
 DEFAULT_AUTH0_CLIENT_ID = "DRivsnm2Mu42T3KOpqdtwB3NYviHYzwD"
 DEFAULT_AUTH0_AUDIENCE = "https://api.openai.com/v1"
 DEFAULT_AUTH_BASE_URL = "https://auth.openai.com"
+
+# API base URLs for different modes
+CHATGPT_BACKEND_BASE_URL = "https://chatgpt.com/backend-api/codex"
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 
 # Token expiry buffer (refresh tokens 5 minutes before expiry)
 TOKEN_EXPIRY_BUFFER_SECONDS = 300
@@ -48,6 +72,7 @@ class ChatGPTOAuthTokenManager:
     - Refreshing expired access tokens
     - Exchanging id_token for OpenAI API keys
     - Thread-safe token storage and updates
+    - Support for both ChatGPT backend and standard OpenAI API modes
     """
 
     _instance: Optional["ChatGPTOAuthTokenManager"] = None
@@ -77,10 +102,20 @@ class ChatGPTOAuthTokenManager:
         self._api_key: Optional[str] = None
         self._access_token_expiry: Optional[float] = None
 
+        # ChatGPT backend specific
+        self._account_id: Optional[str] = None
+
         # Configuration
         self._client_id = get_secret_str("CHATGPT_OAUTH_CLIENT_ID") or DEFAULT_AUTH0_CLIENT_ID
         self._auth_base_url = get_secret_str("CHATGPT_OAUTH_AUTH_URL") or DEFAULT_AUTH_BASE_URL
         self._audience = get_secret_str("CHATGPT_OAUTH_AUDIENCE") or DEFAULT_AUTH0_AUDIENCE
+
+        # Backend mode (auto, chatgpt_backend, or openai_api)
+        mode_str = get_secret_str("CHATGPT_OAUTH_MODE") or "auto"
+        try:
+            self._mode = ChatGPTBackendMode(mode_str.lower())
+        except ValueError:
+            self._mode = ChatGPTBackendMode.AUTO
 
         # Auth file path (default to ~/.codex/auth.json)
         self._auth_file_path = (
@@ -98,6 +133,7 @@ class ChatGPTOAuthTokenManager:
         env_refresh_token = get_secret_str("CHATGPT_OAUTH_REFRESH_TOKEN")
         env_id_token = get_secret_str("CHATGPT_OAUTH_ID_TOKEN")
         env_api_key = get_secret_str("CHATGPT_OAUTH_API_KEY")
+        env_account_id = get_secret_str("CHATGPT_OAUTH_ACCOUNT_ID")
 
         if env_access_token or env_refresh_token or env_api_key:
             verbose_logger.debug("ChatGPT OAuth: Loading tokens from environment variables")
@@ -105,6 +141,7 @@ class ChatGPTOAuthTokenManager:
             self._refresh_token = env_refresh_token
             self._id_token = env_id_token
             self._api_key = env_api_key
+            self._account_id = env_account_id
             return
 
         # Try to load from auth file
@@ -137,6 +174,15 @@ class ChatGPTOAuthTokenManager:
                 tokens.get("api_key")
             )
 
+            # Check for account ID (required for ChatGPT backend mode)
+            # This can be extracted from the access token or stored separately
+            self._account_id = (
+                auth_data.get("account_id") or
+                auth_data.get("chatgpt_account_id") or
+                tokens.get("account_id") or
+                self._extract_account_id_from_token()
+            )
+
             # Parse expiry if present
             expires_at = tokens.get("expires_at")
             if expires_at:
@@ -160,11 +206,60 @@ class ChatGPTOAuthTokenManager:
                 f"ChatGPT OAuth: Tokens loaded - "
                 f"access_token={'present' if self._access_token else 'missing'}, "
                 f"refresh_token={'present' if self._refresh_token else 'missing'}, "
-                f"api_key={'present' if self._api_key else 'missing'}"
+                f"api_key={'present' if self._api_key else 'missing'}, "
+                f"account_id={'present' if self._account_id else 'missing'}"
             )
 
         except Exception as e:
             verbose_logger.warning(f"ChatGPT OAuth: Failed to load auth file: {e}")
+
+    def _extract_account_id_from_token(self) -> Optional[str]:
+        """
+        Extract account ID from the access token JWT.
+
+        The access token from ChatGPT is a JWT that may contain the account ID
+        in its claims (typically as 'https://api.openai.com/auth' claim with
+        'user_id' or 'account_id' field).
+        """
+        if not self._access_token:
+            return None
+
+        try:
+            import base64
+
+            # JWT format: header.payload.signature
+            parts = self._access_token.split(".")
+            if len(parts) != 3:
+                return None
+
+            # Decode the payload (second part)
+            # Add padding if needed
+            payload = parts[1]
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += "=" * padding
+
+            decoded = base64.urlsafe_b64decode(payload)
+            claims = json.loads(decoded)
+
+            # Try various claim locations for account ID
+            # OpenAI uses custom claims under 'https://api.openai.com/auth'
+            auth_claim = claims.get("https://api.openai.com/auth", {})
+            account_id = (
+                auth_claim.get("account_id") or
+                auth_claim.get("user_id") or
+                claims.get("sub") or  # Standard JWT subject claim
+                claims.get("account_id")
+            )
+
+            if account_id:
+                verbose_logger.debug(f"ChatGPT OAuth: Extracted account_id from token")
+                return account_id
+
+        except Exception as e:
+            verbose_logger.debug(f"ChatGPT OAuth: Failed to extract account_id from token: {e}")
+
+        return None
 
     def _save_tokens_to_file(self) -> None:
         """Save updated tokens back to the auth file."""
@@ -366,9 +461,89 @@ class ChatGPTOAuthTokenManager:
                 )
             )
 
-    def get_api_base(self) -> str:
-        """Get the API base URL."""
-        return get_secret_str("CHATGPT_OAUTH_API_BASE") or "https://api.openai.com/v1"
+    def get_effective_mode(self) -> ChatGPTBackendMode:
+        """
+        Determine the effective backend mode based on configuration and available credentials.
+
+        Returns:
+            ChatGPTBackendMode: The mode to use for API requests
+        """
+        if self._mode != ChatGPTBackendMode.AUTO:
+            return self._mode
+
+        # Auto-detect based on available credentials
+        # If we have an API key, prefer OpenAI API mode
+        if self._api_key:
+            return ChatGPTBackendMode.OPENAI_API
+
+        # If we have access_token and account_id, use ChatGPT backend
+        if self._access_token and self._account_id:
+            return ChatGPTBackendMode.CHATGPT_BACKEND
+
+        # If we have access_token but no account_id, try to use it with OpenAI API
+        # (this may fail if token exchange is required)
+        if self._access_token:
+            return ChatGPTBackendMode.OPENAI_API
+
+        # Default to OpenAI API mode
+        return ChatGPTBackendMode.OPENAI_API
+
+    def get_api_base(self, mode: Optional[ChatGPTBackendMode] = None) -> str:
+        """
+        Get the API base URL for the specified or effective mode.
+
+        Args:
+            mode: Optional mode override. If None, uses get_effective_mode().
+
+        Returns:
+            str: The API base URL
+        """
+        # Check for explicit override first
+        explicit_base = get_secret_str("CHATGPT_OAUTH_API_BASE")
+        if explicit_base:
+            return explicit_base
+
+        effective_mode = mode or self.get_effective_mode()
+
+        if effective_mode == ChatGPTBackendMode.CHATGPT_BACKEND:
+            return CHATGPT_BACKEND_BASE_URL
+        else:
+            return OPENAI_API_BASE_URL
+
+    def get_account_id(self) -> Optional[str]:
+        """Get the ChatGPT account ID (required for ChatGPT backend mode)."""
+        return self._account_id
+
+    def get_authorization_headers(self, mode: Optional[ChatGPTBackendMode] = None) -> Dict[str, str]:
+        """
+        Get the authorization headers for API requests.
+
+        For ChatGPT backend mode, includes both Authorization and ChatGPT-Account-ID headers.
+        For OpenAI API mode, includes only Authorization header.
+
+        Args:
+            mode: Optional mode override. If None, uses get_effective_mode().
+
+        Returns:
+            Dict[str, str]: Headers to include in API requests
+        """
+        effective_mode = mode or self.get_effective_mode()
+        token = self.get_authorization_token()
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        if effective_mode == ChatGPTBackendMode.CHATGPT_BACKEND:
+            if self._account_id:
+                headers["ChatGPT-Account-ID"] = self._account_id
+            else:
+                verbose_logger.warning(
+                    "ChatGPT OAuth: ChatGPT backend mode requested but no account_id available"
+                )
+
+        return headers
 
     def reload_tokens(self) -> None:
         """Force reload tokens from the auth file."""
@@ -381,6 +556,7 @@ class ChatGPTOAuthTokenManager:
         refresh_token: Optional[str] = None,
         id_token: Optional[str] = None,
         api_key: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> None:
         """Manually set tokens (useful for testing or programmatic configuration)."""
         with self._token_lock:
@@ -392,6 +568,12 @@ class ChatGPTOAuthTokenManager:
                 self._id_token = id_token
             if api_key:
                 self._api_key = api_key
+            if account_id:
+                self._account_id = account_id
+
+    def set_mode(self, mode: ChatGPTBackendMode) -> None:
+        """Set the backend mode."""
+        self._mode = mode
 
 
 # Global token manager instance
@@ -415,3 +597,39 @@ def get_chatgpt_oauth_credentials() -> Tuple[str, str]:
     """
     manager = get_token_manager()
     return manager.get_api_base(), manager.get_authorization_token()
+
+
+def get_chatgpt_oauth_headers() -> Dict[str, str]:
+    """
+    Get the complete authorization headers for ChatGPT OAuth.
+
+    This includes the Authorization header and, for ChatGPT backend mode,
+    the ChatGPT-Account-ID header.
+
+    Returns:
+        Dict[str, str]: Headers to include in API requests
+    """
+    manager = get_token_manager()
+    return manager.get_authorization_headers()
+
+
+def get_chatgpt_oauth_api_base() -> str:
+    """
+    Get the API base URL for ChatGPT OAuth based on the effective mode.
+
+    Returns:
+        str: The API base URL
+    """
+    manager = get_token_manager()
+    return manager.get_api_base()
+
+
+def get_chatgpt_oauth_mode() -> ChatGPTBackendMode:
+    """
+    Get the effective backend mode for ChatGPT OAuth.
+
+    Returns:
+        ChatGPTBackendMode: The effective mode (CHATGPT_BACKEND or OPENAI_API)
+    """
+    manager = get_token_manager()
+    return manager.get_effective_mode()
