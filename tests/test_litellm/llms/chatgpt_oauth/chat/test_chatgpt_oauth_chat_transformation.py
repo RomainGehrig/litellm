@@ -19,9 +19,9 @@ from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 from litellm.llms.chatgpt_oauth.chat.transformation import ChatGPTOAuthChatConfig
 from litellm.llms.chatgpt_oauth.common_utils import (
-    ChatGPTBackendMode,
     ChatGPTOAuthError,
     ChatGPTOAuthTokenManager,
+    CHATGPT_BACKEND_BASE_URL,
 )
 
 
@@ -51,35 +51,41 @@ class TestChatGPTOAuthChatTransformation:
         assert config.custom_llm_provider == "chatgpt_oauth"
 
     @patch(
-        "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_credentials"
+        "litellm.llms.chatgpt_oauth.chat.transformation.get_token_manager"
     )
-    def test_get_openai_compatible_provider_info(self, mock_get_creds):
+    def test_get_openai_compatible_provider_info(self, mock_get_manager):
         """Test _get_openai_compatible_provider_info returns OAuth credentials"""
-        mock_get_creds.return_value = ("https://api.openai.com/v1", "sk-oauth-token")
+        mock_manager = MagicMock()
+        mock_manager.get_api_base.return_value = CHATGPT_BACKEND_BASE_URL
+        mock_manager.get_access_token.return_value = "oauth-access-token"
+        mock_get_manager.return_value = mock_manager
 
         config = ChatGPTOAuthChatConfig()
         api_base, api_key = config._get_openai_compatible_provider_info(
             api_base=None, api_key=None
         )
 
-        assert api_base == "https://api.openai.com/v1"
-        assert api_key == "sk-oauth-token"
+        assert api_base == CHATGPT_BACKEND_BASE_URL
+        assert api_key == "oauth-access-token"
 
     @patch(
-        "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_credentials"
+        "litellm.llms.chatgpt_oauth.chat.transformation.get_token_manager"
     )
-    def test_get_openai_compatible_provider_info_with_override(self, mock_get_creds):
+    def test_get_openai_compatible_provider_info_with_override(self, mock_get_manager):
         """Test _get_openai_compatible_provider_info respects api_base override"""
-        mock_get_creds.return_value = ("https://api.openai.com/v1", "sk-oauth-token")
+        mock_manager = MagicMock()
+        mock_manager.get_api_base.return_value = CHATGPT_BACKEND_BASE_URL
+        mock_manager.get_access_token.return_value = "oauth-access-token"
+        mock_get_manager.return_value = mock_manager
 
         config = ChatGPTOAuthChatConfig()
         api_base, api_key = config._get_openai_compatible_provider_info(
-            api_base="https://custom.api.com/v1", api_key=None
+            api_base="https://custom.api.com/codex", api_key=None
         )
 
         # Should use provided api_base but OAuth token
-        assert api_base == "https://custom.api.com/v1"
-        assert api_key == "sk-oauth-token"
+        assert api_base == "https://custom.api.com/codex"
+        assert api_key == "oauth-access-token"
 
     @patch(
         "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_headers"
@@ -87,8 +93,9 @@ class TestChatGPTOAuthChatTransformation:
     def test_validate_environment(self, mock_get_headers):
         """Test validate_environment sets correct headers"""
         mock_get_headers.return_value = {
-            "Authorization": "Bearer sk-oauth-token",
+            "Authorization": "Bearer oauth-access-token",
             "Content-Type": "application/json",
+            "ChatGPT-Account-ID": "account-123",
         }
 
         config = ChatGPTOAuthChatConfig()
@@ -102,8 +109,9 @@ class TestChatGPTOAuthChatTransformation:
             api_base=None,
         )
 
-        assert headers["Authorization"] == "Bearer sk-oauth-token"
+        assert headers["Authorization"] == "Bearer oauth-access-token"
         assert headers["Content-Type"] == "application/json"
+        assert headers["ChatGPT-Account-ID"] == "account-123"
 
     @patch(
         "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_headers"
@@ -111,8 +119,9 @@ class TestChatGPTOAuthChatTransformation:
     def test_validate_environment_preserves_existing_headers(self, mock_get_headers):
         """Test validate_environment preserves existing headers"""
         mock_get_headers.return_value = {
-            "Authorization": "Bearer sk-oauth-token",
+            "Authorization": "Bearer oauth-access-token",
             "Content-Type": "application/json",
+            "ChatGPT-Account-ID": "account-123",
         }
 
         config = ChatGPTOAuthChatConfig()
@@ -127,14 +136,14 @@ class TestChatGPTOAuthChatTransformation:
         )
 
         assert headers["X-Custom-Header"] == "custom-value"
-        assert headers["Authorization"] == "Bearer sk-oauth-token"
+        assert headers["Authorization"] == "Bearer oauth-access-token"
 
     @patch(
         "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_api_base"
     )
     def test_get_complete_url_default(self, mock_get_base):
         """Test get_complete_url returns correct endpoint"""
-        mock_get_base.return_value = "https://api.openai.com/v1"
+        mock_get_base.return_value = CHATGPT_BACKEND_BASE_URL
 
         config = ChatGPTOAuthChatConfig()
         url = config.get_complete_url(
@@ -146,13 +155,13 @@ class TestChatGPTOAuthChatTransformation:
             stream=False,
         )
 
-        assert url == "https://api.openai.com/v1/chat/completions"
+        assert url == f"{CHATGPT_BACKEND_BASE_URL}/chat/completions"
 
     def test_get_complete_url_with_custom_base(self):
         """Test get_complete_url with custom api_base"""
         config = ChatGPTOAuthChatConfig()
         url = config.get_complete_url(
-            api_base="https://custom.api.com/v1",
+            api_base="https://custom.api.com/codex",
             api_key=None,
             model="gpt-4",
             optional_params={},
@@ -160,13 +169,13 @@ class TestChatGPTOAuthChatTransformation:
             stream=False,
         )
 
-        assert url == "https://custom.api.com/v1/chat/completions"
+        assert url == "https://custom.api.com/codex/chat/completions"
 
     def test_get_complete_url_handles_trailing_slash(self):
         """Test get_complete_url handles trailing slash in api_base"""
         config = ChatGPTOAuthChatConfig()
         url = config.get_complete_url(
-            api_base="https://api.openai.com/v1/",
+            api_base=f"{CHATGPT_BACKEND_BASE_URL}/",
             api_key=None,
             model="gpt-4",
             optional_params={},
@@ -174,25 +183,29 @@ class TestChatGPTOAuthChatTransformation:
             stream=False,
         )
 
-        assert url == "https://api.openai.com/v1/chat/completions"
+        assert url == f"{CHATGPT_BACKEND_BASE_URL}/chat/completions"
 
     @patch(
-        "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_credentials"
+        "litellm.llms.chatgpt_oauth.chat.transformation.get_token_manager"
     )
-    def test_get_api_key_returns_oauth_token(self, mock_get_creds):
+    def test_get_api_key_returns_oauth_token(self, mock_get_manager):
         """Test get_api_key returns OAuth token"""
-        mock_get_creds.return_value = ("https://api.openai.com/v1", "sk-oauth-token")
+        mock_manager = MagicMock()
+        mock_manager.get_access_token.return_value = "oauth-access-token"
+        mock_get_manager.return_value = mock_manager
 
         token = ChatGPTOAuthChatConfig.get_api_key()
 
-        assert token == "sk-oauth-token"
+        assert token == "oauth-access-token"
 
     @patch(
-        "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_credentials"
+        "litellm.llms.chatgpt_oauth.chat.transformation.get_token_manager"
     )
-    def test_get_api_key_returns_none_on_error(self, mock_get_creds):
+    def test_get_api_key_returns_none_on_error(self, mock_get_manager):
         """Test get_api_key returns None when OAuth fails"""
-        mock_get_creds.side_effect = ChatGPTOAuthError(401, "No token")
+        mock_manager = MagicMock()
+        mock_manager.get_access_token.side_effect = ChatGPTOAuthError(401, "No token")
+        mock_get_manager.return_value = mock_manager
 
         token = ChatGPTOAuthChatConfig.get_api_key()
 
@@ -203,19 +216,19 @@ class TestChatGPTOAuthChatTransformation:
     )
     def test_get_api_base_default(self, mock_get_base):
         """Test get_api_base returns OAuth api_base"""
-        mock_get_base.return_value = "https://api.openai.com/v1"
+        mock_get_base.return_value = CHATGPT_BACKEND_BASE_URL
 
         api_base = ChatGPTOAuthChatConfig.get_api_base()
 
-        assert api_base == "https://api.openai.com/v1"
+        assert api_base == CHATGPT_BACKEND_BASE_URL
 
     def test_get_api_base_with_override(self):
         """Test get_api_base respects override"""
         api_base = ChatGPTOAuthChatConfig.get_api_base(
-            api_base="https://custom.api.com/v1"
+            api_base="https://custom.api.com/codex"
         )
 
-        assert api_base == "https://custom.api.com/v1"
+        assert api_base == "https://custom.api.com/codex"
 
     def test_inherits_from_openai_gpt_config(self):
         """Test that ChatGPTOAuthChatConfig inherits OpenAI GPT config methods"""
@@ -296,68 +309,5 @@ class TestChatGPTOAuthChatValidation:
             stream=False,
         )
 
-        # Should fall back to default OpenAI API
-        assert url == "https://api.openai.com/v1/chat/completions"
-
-
-class TestChatGPTOAuthChatChatGPTBackend:
-    """Test ChatGPT backend mode specific functionality"""
-
-    def setup_method(self):
-        """Reset singleton before each test"""
-        ChatGPTOAuthTokenManager._instance = None
-
-    @patch(
-        "litellm.llms.chatgpt_oauth.chat.transformation.get_chatgpt_oauth_headers"
-    )
-    def test_validate_environment_with_account_id(self, mock_get_headers):
-        """Test validate_environment includes ChatGPT-Account-ID header in backend mode"""
-        mock_get_headers.return_value = {
-            "Authorization": "Bearer access-token",
-            "Content-Type": "application/json",
-            "ChatGPT-Account-ID": "account-123",
-        }
-
-        config = ChatGPTOAuthChatConfig()
-        headers = config.validate_environment(
-            headers={},
-            model="gpt-4",
-            messages=[{"role": "user", "content": "Hello"}],
-            optional_params={},
-            litellm_params={},
-            api_key=None,
-            api_base=None,
-        )
-
-        assert headers["Authorization"] == "Bearer access-token"
-        assert headers["ChatGPT-Account-ID"] == "account-123"
-
-    def test_get_complete_url_chatgpt_backend_base(self):
-        """Test URL construction for ChatGPT backend"""
-        config = ChatGPTOAuthChatConfig()
-        url = config.get_complete_url(
-            api_base="https://chatgpt.com/backend-api/codex",
-            api_key=None,
-            model="gpt-5.1-codex",
-            optional_params={},
-            litellm_params={},
-            stream=False,
-        )
-
-        # ChatGPT backend still uses /chat/completions
-        assert url == "https://chatgpt.com/backend-api/codex/chat/completions"
-        assert "/v1" not in url
-
-    def test_get_complete_url_adds_v1_for_openai_api(self):
-        """Test URL construction adds /v1 for OpenAI API when missing"""
-        config = ChatGPTOAuthChatConfig()
-        url = config.get_complete_url(
-            api_base="https://api.openai.com",
-            api_key=None,
-            model="gpt-4",
-            optional_params={},
-            litellm_params={},
-            stream=False,
-        )
-
-        assert url == "https://api.openai.com/v1/chat/completions"
+        # Should fall back to default ChatGPT backend
+        assert url == f"{CHATGPT_BACKEND_BASE_URL}/chat/completions"
