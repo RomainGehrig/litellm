@@ -1371,6 +1371,8 @@ from .llms.cometapi.embed.transformation import CometAPIEmbeddingConfig
 from .llms.lemonade.chat.transformation import LemonadeChatConfig
 from .llms.snowflake.embedding.transformation import SnowflakeEmbeddingConfig
 from .llms.amazon_nova.chat.transformation import AmazonNovaChatConfig
+from .llms.chatgpt_oauth.chat.transformation import ChatGPTOAuthChatConfig
+from .llms.chatgpt_oauth.responses.transformation import ChatGPTOAuthResponsesAPIConfig
 from .main import *  # type: ignore
 
 # Skills API

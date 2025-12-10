@@ -7288,6 +7288,8 @@ class ProviderConfigManager:
             return litellm.OVHCloudChatConfig()
         elif litellm.LlmProviders.AMAZON_NOVA == provider:
             return litellm.AmazonNovaChatConfig()
+        elif litellm.LlmProviders.CHATGPT_OAUTH == provider:
+            return litellm.ChatGPTOAuthChatConfig()
         return None
 
     @staticmethod
@@ -7483,6 +7485,8 @@ class ProviderConfigManager:
             return litellm.GithubCopilotResponsesAPIConfig()
         elif litellm.LlmProviders.LITELLM_PROXY == provider:
             return litellm.LiteLLMProxyResponsesAPIConfig()
+        elif litellm.LlmProviders.CHATGPT_OAUTH == provider:
+            return litellm.ChatGPTOAuthResponsesAPIConfig()
         return None
 
     @staticmethod
